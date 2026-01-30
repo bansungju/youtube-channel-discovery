@@ -75,11 +75,58 @@ def filter_quality_channels(channels: List[Dict], min_subscribers: int = 10000) 
     return filtered
 
 def save_to_notion(channels: List[Dict]) -> int:
+    print(f"\n🔍 Notion 디버그 정보:")
+    print(f"  - API Key 존재: {bool(NOTION_API_KEY)}")
+    print(f"  - API Key 앞 10자: {NOTION_API_KEY[:10] if NOTION_API_KEY else 'None'}...")
+    print(f"  - Database ID: {NOTION_DATABASE_ID}")
+    print(f"  - 저장할 채널 수: {len(channels)}")
+    
     if not NOTION_API_KEY or not NOTION_DATABASE_ID:
+        print("⚠️ Notion API 설정 없음 - 저장 스킵")
         return 0
-    headers = {'Authorization': f'Bearer {NOTION_API_KEY}', 'Content-Type': 'application/json', 'Notion-Version': '2022-06-28'}
+
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28'
+    }
+    
     saved_count = 0
-    for ch in channels:
+    
+    # 첫 번째 채널로 테스트
+    if channels:
+        ch = channels[0]
+        print(f"\n🧪 첫 번째 채널 테스트: {ch['name']}")
+        
+        data = {
+            'parent': {'database_id': NOTION_DATABASE_ID},
+            'properties': {
+                '채널명': {'title': [{'text': {'content': ch['name']}}]},
+                'Channel ID': {'rich_text': [{'text': {'content': ch['channel_id']}}]},
+                'URL': {'url': ch['url']},
+                '구독자': {'number': ch['subscriber_count']},
+                '영상수': {'number': ch['video_count']},
+                '상태': {'select': {'name': '검토 대상'}},
+                '발견일': {'date': {'start': datetime.now().isoformat()[:10]}}
+            }
+        }
+        
+        print(f"  - Request data: {json.dumps(data, ensure_ascii=False, indent=2)[:500]}...")
+        
+        response = requests.post('https://api.notion.com/v1/pages', headers=headers, json=data)
+        
+        print(f"  - Response status: {response.status_code}")
+        print(f"  - Response body: {response.text[:500]}")
+        
+        if response.status_code == 200:
+            saved_count += 1
+            print("  ✅ 첫 번째 채널 저장 성공!")
+        else:
+            print(f"  ❌ 첫 번째 채널 저장 실패!")
+            return 0  # 첫 번째가 실패하면 나머지도 실패할 것이므로 중단
+
+    # 나머지 채널 저장
+    for ch in channels[1:]:
         data = {
             'parent': {'database_id': NOTION_DATABASE_ID},
             'properties': {
@@ -95,6 +142,7 @@ def save_to_notion(channels: List[Dict]) -> int:
         response = requests.post('https://api.notion.com/v1/pages', headers=headers, json=data)
         if response.status_code == 200:
             saved_count += 1
+
     return saved_count
 
 def send_slack_notification(new_channels: List[Dict]):
@@ -173,10 +221,6 @@ def main():
     
     print("\n" + "=" * 50)
     print(f"✅ 완료! {len(quality_channels)}개 새 채널 발견")
-    
-    print("\n📋 발견된 채널 목록:")
-    for ch in quality_channels[:10]:
-        print(f"  • {ch['name']} ({ch['subscriber_count']:,} 구독자)")
 
 if __name__ == "__main__":
     main()
