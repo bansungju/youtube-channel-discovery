@@ -1,6 +1,7 @@
 """
 YouTube Channel Discovery Bot
 구독 채널 기반으로 관련 채널을 자동 발견하여 Notion에 저장
+(중복 체크 기능 포함)
 """
 
 import os
@@ -34,6 +35,53 @@ def get_existing_channels() -> Dict[str, str]:
     data = response.json()
     return {ch['channel_id']: ch['name'] for ch in data['channels']}
 
+
+def get_notion_existing_channel_ids() -> Set[str]:
+    """Notion DB에 이미 존재하는 Channel ID 목록 조회 (중복 방지용)"""
+    if not NOTION_API_KEY or not NOTION_DATABASE_ID:
+        return set()
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28'
+    }
+    
+    existing_ids = set()
+    has_more = True
+    start_cursor = None
+    
+    while has_more:
+        body = {"page_size": 100}
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        
+        response = requests.post(
+            f'https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query',
+            headers=headers,
+            json=body
+        )
+        
+        if response.status_code != 200:
+            print(f"⚠️ Notion DB 조회 실패: {response.status_code}")
+            break
+        
+        data = response.json()
+        
+        for page in data.get('results', []):
+            channel_id_prop = page.get('properties', {}).get('Channel ID', {}).get('rich_text', [])
+            if channel_id_prop:
+                channel_id = channel_id_prop[0].get('plain_text', '')
+                if channel_id:
+                    existing_ids.add(channel_id)
+        
+        has_more = data.get('has_more', False)
+        start_cursor = data.get('next_cursor')
+    
+    print(f"📋 Notion DB 기존 채널: {len(existing_ids)}개")
+    return existing_ids
+
+
 def get_channel_details(channel_ids: List[str]) -> List[Dict]:
     channels = []
     for i in range(0, len(channel_ids), 50):
@@ -45,6 +93,7 @@ def get_channel_details(channel_ids: List[str]) -> List[Dict]:
             channels.extend(response.json().get('items', []))
     return channels
 
+
 def search_channels_by_keyword(keyword: str, max_results: int = 10) -> List[str]:
     url = "https://www.googleapis.com/youtube/v3/search"
     params = {'key': YOUTUBE_API_KEY, 'q': keyword, 'type': 'channel', 'part': 'snippet', 'maxResults': max_results, 'order': 'relevance'}
@@ -53,6 +102,7 @@ def search_channels_by_keyword(keyword: str, max_results: int = 10) -> List[str]
         return [item['snippet']['channelId'] for item in response.json().get('items', [])]
     print(f"⚠️ Search API 오류 ({keyword}): {response.status_code}")
     return []
+
 
 def filter_quality_channels(channels: List[Dict], min_subscribers: int = 10000) -> List[Dict]:
     filtered = []
@@ -74,12 +124,13 @@ def filter_quality_channels(channels: List[Dict], min_subscribers: int = 10000) 
             })
     return filtered
 
-def save_to_notion(channels: List[Dict]) -> int:
+
+def save_to_notion(channels: List[Dict], existing_notion_ids: Set[str]) -> int:
+    """Notion에 저장 (중복 체크 포함)"""
     print(f"\n🔍 Notion 디버그 정보:")
     print(f"  - API Key 존재: {bool(NOTION_API_KEY)}")
-    print(f"  - API Key 앞 10자: {NOTION_API_KEY[:10] if NOTION_API_KEY else 'None'}...")
     print(f"  - Database ID: {NOTION_DATABASE_ID}")
-    print(f"  - 저장할 채널 수: {len(channels)}")
+    print(f"  - 저장 대상 채널 수: {len(channels)}")
     
     if not NOTION_API_KEY or not NOTION_DATABASE_ID:
         print("⚠️ Notion API 설정 없음 - 저장 스킵")
@@ -92,11 +143,14 @@ def save_to_notion(channels: List[Dict]) -> int:
     }
     
     saved_count = 0
+    skipped_count = 0
     
-    # 첫 번째 채널로 테스트
-    if channels:
-        ch = channels[0]
-        print(f"\n🧪 첫 번째 채널 테스트: {ch['name']}")
+    for ch in channels:
+        # 🔥 중복 체크: 이미 Notion에 있는 Channel ID면 스킵
+        if ch['channel_id'] in existing_notion_ids:
+            print(f"  ⏭️ 중복 스킵: {ch['name']} ({ch['channel_id']})")
+            skipped_count += 1
+            continue
         
         data = {
             'parent': {'database_id': NOTION_DATABASE_ID},
@@ -111,39 +165,21 @@ def save_to_notion(channels: List[Dict]) -> int:
             }
         }
         
-        print(f"  - Request data: {json.dumps(data, ensure_ascii=False, indent=2)[:500]}...")
-        
         response = requests.post('https://api.notion.com/v1/pages', headers=headers, json=data)
-        
-        print(f"  - Response status: {response.status_code}")
-        print(f"  - Response body: {response.text[:500]}")
         
         if response.status_code == 200:
             saved_count += 1
-            print("  ✅ 첫 번째 채널 저장 성공!")
+            print(f"  ✅ 저장: {ch['name']}")
+            # 저장 후 existing_notion_ids에 추가 (같은 실행 내 중복 방지)
+            existing_notion_ids.add(ch['channel_id'])
         else:
-            print(f"  ❌ 첫 번째 채널 저장 실패!")
-            return 0  # 첫 번째가 실패하면 나머지도 실패할 것이므로 중단
-
-    # 나머지 채널 저장
-    for ch in channels[1:]:
-        data = {
-            'parent': {'database_id': NOTION_DATABASE_ID},
-            'properties': {
-                '채널명': {'title': [{'text': {'content': ch['name']}}]},
-                'Channel ID': {'rich_text': [{'text': {'content': ch['channel_id']}}]},
-                'URL': {'url': ch['url']},
-                '구독자': {'number': ch['subscriber_count']},
-                '영상수': {'number': ch['video_count']},
-                '상태': {'select': {'name': '검토 대상'}},
-                '발견일': {'date': {'start': datetime.now().isoformat()[:10]}}
-            }
-        }
-        response = requests.post('https://api.notion.com/v1/pages', headers=headers, json=data)
-        if response.status_code == 200:
-            saved_count += 1
-
+            print(f"  ❌ 저장 실패: {ch['name']} - {response.status_code}")
+    
+    if skipped_count > 0:
+        print(f"\n⏭️ 중복으로 스킵된 채널: {skipped_count}개")
+    
     return saved_count
+
 
 def send_slack_notification(new_channels: List[Dict]):
     if not SLACK_WEBHOOK_URL or not new_channels:
@@ -156,6 +192,7 @@ def send_slack_notification(new_channels: List[Dict]):
     message += "\n📋 Notion '검토 대상' DB에서 확인하세요!"
     requests.post(SLACK_WEBHOOK_URL, json={'text': message})
 
+
 def load_discovered_channels() -> Set[str]:
     try:
         with open('discovered_channels.json', 'r') as f:
@@ -163,9 +200,11 @@ def load_discovered_channels() -> Set[str]:
     except FileNotFoundError:
         return set()
 
+
 def save_discovered_channels(channel_ids: Set[str]):
     with open('discovered_channels.json', 'w') as f:
         json.dump({'channel_ids': list(channel_ids), 'last_updated': datetime.now().isoformat()}, f, indent=2)
+
 
 def main():
     print("🚀 YouTube Channel Discovery 시작")
@@ -176,8 +215,11 @@ def main():
     existing_ids = set(existing_channels.keys())
     print(f"📺 기존 구독 채널: {len(existing_ids)}개")
     
+    # 🔥 Notion DB에서 기존 Channel ID 조회 (중복 방지)
+    existing_notion_ids = get_notion_existing_channel_ids()
+    
     discovered_ids = load_discovered_channels()
-    print(f"📋 이미 발견된 채널: {len(discovered_ids)}개")
+    print(f"📋 이미 발견된 채널 (로컬): {len(discovered_ids)}개")
     
     print(f"\n🔍 {len(SEARCH_KEYWORDS)}개 키워드로 검색 중...")
     all_found_ids = set()
@@ -189,7 +231,8 @@ def main():
     
     print(f"\n🔗 총 검색된 채널: {len(all_found_ids)}개")
     
-    new_ids = all_found_ids - existing_ids - discovered_ids
+    # 기존 구독 채널, 로컬 발견 목록, Notion DB에 있는 채널 모두 제외
+    new_ids = all_found_ids - existing_ids - discovered_ids - existing_notion_ids
     print(f"🆕 새로운 채널: {len(new_ids)}개")
     
     if not new_ids:
@@ -210,17 +253,23 @@ def main():
     
     quality_channels.sort(key=lambda x: x['subscriber_count'], reverse=True)
     
-    saved = save_to_notion(quality_channels)
+    # 🔥 중복 체크 포함된 저장 함수 호출
+    saved = save_to_notion(quality_channels, existing_notion_ids)
     print(f"💾 Notion 저장: {saved}개")
     
-    send_slack_notification(quality_channels)
-    print("📤 Slack 알림 전송 완료")
+    # Slack 알림은 실제 저장된 채널만
+    if saved > 0:
+        # 실제 저장된 채널만 필터링
+        saved_channels = [ch for ch in quality_channels if ch['channel_id'] in existing_notion_ids]
+        send_slack_notification(saved_channels[-saved:] if saved_channels else quality_channels[:saved])
+        print("📤 Slack 알림 전송 완료")
     
     discovered_ids.update(new_ids)
     save_discovered_channels(discovered_ids)
     
     print("\n" + "=" * 50)
-    print(f"✅ 완료! {len(quality_channels)}개 새 채널 발견")
+    print(f"✅ 완료! {saved}개 새 채널 저장 (중복 제외)")
+
 
 if __name__ == "__main__":
     main()
